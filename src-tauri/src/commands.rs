@@ -45,7 +45,13 @@ pub async fn connect_to_server(
         state.window.clone(),
     );
 
-    let reconnect_manager = crate::websocket::ReconnectionManager::new(client.clone());
+    // Store client in state
+    {
+        let mut client_opt = state.client.lock().await;
+        *client_opt = Some(client.clone());
+    }
+
+    let reconnect_manager = crate::websocket::ReconnectionManager::new(client);
 
     // Start connection with retry logic
     tokio::spawn(async move {

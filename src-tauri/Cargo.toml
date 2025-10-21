@@ -26,3 +26,12 @@ futures-util = "0.3"
 [features]
 # This feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
+
+[lints.clippy]
+# Deny clippy warnings to enforce code quality (constitution requirement)
+all = "deny"
+pedantic = "warn"
+# Allow some pedantic lints that are too strict
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

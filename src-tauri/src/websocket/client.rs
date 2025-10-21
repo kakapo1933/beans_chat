@@ -1,18 +1,26 @@
 use crate::models::{ConnectionState, WSMessage};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use std::sync::Arc;
 use tauri::{Manager, Window};
 use tokio::sync::Mutex;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream};
 
+type WsWriter = Arc<Mutex<Option<SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>>>>;
+
+#[derive(Clone)]
 pub struct WebSocketClient {
     url: String,
-    window: Window,
+    pub window: Window,
+    writer: WsWriter,
 }
 
 impl WebSocketClient {
     pub fn new(url: String, window: Window) -> Self {
-        Self { url, window }
+        Self {
+            url,
+            window,
+            writer: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Connect to WebSocket server and handle messages
@@ -31,9 +39,41 @@ impl WebSocketClient {
         // Emit connected status
         self.emit_connection_status(ConnectionState::Connected);
 
-        let (mut write, mut read) = ws_stream.split();
+        let (write, mut read) = ws_stream.split();
+
+        // Store the write half for sending messages
+        {
+            let mut writer = self.writer.lock().await;
+            *writer = Some(write);
+        }
 
         let window = self.window.clone();
+        let writer_for_disconnect = self.writer.clone();
+        let writer_for_ping = self.writer.clone();
+        let self_for_reconnect = self.clone();
+
+        // Spawn heartbeat task to send periodic pings
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+
+                let mut writer = writer_for_ping.lock().await;
+                if let Some(ws_writer) = writer.as_mut() {
+                    let ping_msg = WSMessage::Ping;
+                    if let Ok(json) = serde_json::to_string(&ping_msg) {
+                        if ws_writer.send(Message::Text(json)).await.is_err() {
+                            log::warn!("Failed to send ping, connection may be dead");
+                            break;
+                        }
+                        log::debug!("Sent ping");
+                    }
+                } else {
+                    // Connection closed, exit heartbeat loop
+                    break;
+                }
+            }
+        });
 
         // Spawn task to handle incoming messages
         tokio::spawn(async move {
@@ -82,10 +122,22 @@ impl WebSocketClient {
                 }
             }
 
-            // Emit disconnected status when connection closes
+            // Clear the writer and emit disconnected status when connection closes
+            {
+                let mut writer = writer_for_disconnect.lock().await;
+                *writer = None;
+            }
+
             window
                 .emit("connection_status", ConnectionState::Disconnected)
                 .ok();
+
+            // Auto-reconnect when connection is lost
+            log::info!("Connection lost, starting reconnection...");
+            let reconnect_manager = crate::websocket::ReconnectionManager::new(self_for_reconnect);
+            tokio::spawn(async move {
+                reconnect_manager.connect_with_retry().await;
+            });
         });
 
         Ok(())
@@ -93,13 +145,22 @@ impl WebSocketClient {
 
     /// Send a message to the WebSocket server
     pub async fn send_message(&self, message: WSMessage) -> Result<(), String> {
-        let json = serde_json::to_string(&message).map_err(|e| format!("Failed to serialize message: {}", e))?;
+        let json = serde_json::to_string(&message)
+            .map_err(|e| format!("Failed to serialize message: {}", e))?;
 
-        // In a real implementation, we'd need to store the write half of the stream
-        // For now, this is a placeholder that will be improved
-        log::info!("Sending message: {}", json);
+        let mut writer = self.writer.lock().await;
 
-        Ok(())
+        if let Some(ws_writer) = writer.as_mut() {
+            ws_writer
+                .send(Message::Text(json.clone()))
+                .await
+                .map_err(|e| format!("Failed to send message: {}", e))?;
+
+            log::info!("Sent message: {}", json);
+            Ok(())
+        } else {
+            Err("Not connected to WebSocket server".to_string())
+        }
     }
 
     fn emit_connection_status(&self, status: ConnectionState) {
